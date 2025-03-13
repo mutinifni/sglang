@@ -16,6 +16,7 @@
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/mixtral.py#L1
 """Inference-only Mixtral model."""
 
+import os
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -93,13 +94,43 @@ class MixtralMoE(nn.Module):
             tp_size=tp_size,
             prefix=add_prefix("experts", prefix),
         )
+        self.initialize_custom_routing(num_experts, top_k)
+        self.num_experts = num_experts
+        self.top_k = top_k
+
+    def initialize_custom_routing(self, num_experts, top_k):
+        self.custom_routing_enabled = True
+
+        distribution_name = os.getenv('CUSTOM_ROUTING_DISTRIBUTION', 'default')
+        if distribution_name == 'default':
+            self.custom_routing_enabled = False
+            distribution = [1.0] * num_experts
+        elif distribution_name == 'uniform':
+            distribution = [1.0] * num_experts
+        elif distribution_name == 'skew':
+            distribution = [1.0] * top_k + [0.0] * (num_experts - top_k)
+        else:
+            raise ValueError(f"Unknown custom routing distribution: {custom_routing_distribution}")
+
+        self.prob_dist_per_token = torch.tensor(distribution, device='cuda')
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
+        num_tokens = hidden_states.shape[0]
+
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+
+        # custom_router_logits: (num_tokens, n_experts)
+        probability_distribution = self.prob_dist_per_token.expand(num_tokens, -1)
+        sampled_experts = torch.multinomial(probability_distribution, self.top_k, replacement=False)
+        custom_router_logits = torch.zeros((num_tokens, self.experts.num_experts), device=hidden_states.device)
+        custom_router_logits.scatter_(1, sampled_experts, 1)
+        if self.custom_routing_enabled:
+            router_logits = custom_router_logits
+
         final_hidden_states = self.experts(hidden_states, router_logits)
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
