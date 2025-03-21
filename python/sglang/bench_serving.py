@@ -859,6 +859,7 @@ def sample_generated_shared_prefix_requests(
 async def get_request(
     input_requests: List[Tuple[str, int, int]],
     request_rate: float,
+    interarrival_distribution: str,
 ) -> AsyncGenerator[Tuple[str, int, int], None]:
     input_requests = iter(input_requests)
     for request in input_requests:
@@ -868,8 +869,15 @@ async def get_request(
             # If the request rate is infinity, then we don't need to wait.
             continue
 
-        # Sample the request interval from the exponential distribution.
-        interval = np.random.exponential(1.0 / request_rate)
+        if interarrival_distribution == "exponential":
+            # Sample the request interval from the exponential distribution.
+            interval = np.random.exponential(1.0 / request_rate)
+        elif interarrival_distribution == "constant":
+            # Use a constant interval.
+            interval = 1.0 / request_rate
+        else:
+            raise ValueError(f"Unknown interarrival distribution: {interarrival_distribution}")
+
         # The next request will be sent after the interval.
         await asyncio.sleep(interval)
 
@@ -961,6 +969,7 @@ async def benchmark(
     tokenizer: PreTrainedTokenizerBase,
     input_requests: List[Tuple[str, int, int]],
     request_rate: float,
+    interarrival_distribution: str,
     max_concurrency: Optional[int],
     disable_tqdm: bool,
     lora_name: str,
@@ -1024,7 +1033,7 @@ async def benchmark(
     # Run all requests
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
-    async for request in get_request(input_requests, request_rate):
+    async for request in get_request(input_requests, request_rate, interarrival_distribution):
         prompt, prompt_len, output_len = request
         request_func_input = RequestFuncInput(
             model=model_id,
@@ -1076,6 +1085,7 @@ async def benchmark(
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Backend:", backend))
     print("{:<40} {:<10}".format("Traffic request rate:", request_rate))
+    print("{:<40} {:<10}".format("Interarrival distribution:", interarrival_distribution))
     print(
         "{:<40} {:<10}".format(
             "Max reqeuest concurrency:",
@@ -1145,6 +1155,7 @@ async def benchmark(
             "backend": args.backend,
             "dataset_name": args.dataset_name,
             "request_rate": request_rate,
+            "interarrival_distribution": interarrival_distribution,
             "max_concurrency": max_concurrency,
             "sharegpt_output_len": args.sharegpt_output_len,
             "random_input_len": args.random_input_len,
@@ -1343,6 +1354,7 @@ def run_benchmark(args_: argparse.Namespace):
             tokenizer=tokenizer,
             input_requests=input_requests,
             request_rate=args.request_rate,
+            interarrival_distribution=args.interarrival_distribution,
             max_concurrency=args.max_concurrency,
             disable_tqdm=args.disable_tqdm,
             lora_name=args.lora_name,
@@ -1450,6 +1462,13 @@ if __name__ == "__main__":
         default=float("inf"),
         help="Number of requests per second. If this is inf, then all the requests are sent at time 0. "
         "Otherwise, we use Poisson process to synthesize the request arrival times. Default is inf.",
+    )
+    parser.add_argument(
+        "--interarrival-distribution",
+        type=str,
+        default="constant",
+        choices=["exponential", "constant"],
+        help="Interarrival distribution for request rate. Default is constant.",
     )
     parser.add_argument(
         "--max-concurrency",
