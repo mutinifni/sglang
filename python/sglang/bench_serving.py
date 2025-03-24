@@ -901,6 +901,7 @@ def calculate_metrics(
         if outputs[i].success:
             output_len = outputs[i].output_len
             output_lens.append(output_len)
+            #print(f"Generated {i}: {outputs[i].generated_text}")
             retokenized_output_len = len(
                 tokenizer.encode(outputs[i].generated_text, add_special_tokens=False)
             )
@@ -912,6 +913,7 @@ def calculate_metrics(
             ttfts.append(outputs[i].ttft)
 
             e2e_latencies.append(outputs[i].latency)
+            print(i, outputs[i].latency)
 
             completed += 1
         else:
@@ -1016,6 +1018,30 @@ async def benchmark(
     # Flush cache
     if "sglang" in backend:
         requests.post(base_url + "/flush_cache", headers=get_auth_headers())
+
+    # Warmup by running all requests
+    print("Starting warmup run...")
+    warmup_start_time = time.perf_counter()
+    warmup_tasks: List[asyncio.Task] = []
+    async for request in get_request(input_requests, request_rate, interarrival_distribution):
+        prompt, prompt_len, output_len = request
+        request_func_input = RequestFuncInput(
+            model=model_id,
+            prompt=prompt,
+            api_url=api_url,
+            prompt_len=prompt_len,
+            output_len=output_len,
+            lora_name=lora_name,
+            extra_request_body=extra_request_body,
+        )
+        warmup_tasks.append(
+            asyncio.create_task(
+                limited_request_func(request_func_input=request_func_input, pbar=None)
+            )
+        )
+    await asyncio.gather(*warmup_tasks)
+    warmup_duration = time.perf_counter() - warmup_start_time
+    print(f"Warmup completed in {warmup_duration:.2f} seconds")
 
     time.sleep(1.0)
 
