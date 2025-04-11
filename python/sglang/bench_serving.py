@@ -65,6 +65,8 @@ class RequestFuncOutput:
     prompt_len: int = 0
     error: str = ""
     output_len: int = 0
+    start_time: float = 0.0  # Time when request was started
+    completion_time: float = 0.0  # Time when request was completed
 
 
 def remove_prefix(text: str, prefix: str) -> str:
@@ -112,6 +114,7 @@ async def async_request_trt_llm(
 
         ttft = 0.0
         st = time.perf_counter()
+        output.start_time = st
         most_recent_timestamp = st
         try:
             async with session.post(url=api_url, json=payload) as response:
@@ -148,6 +151,8 @@ async def async_request_trt_llm(
             output.success = False
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
+
+        output.completion_time = time.perf_counter()
 
         if pbar:
             pbar.update(1)
@@ -186,6 +191,7 @@ async def async_request_openai_completions(
         output_len = request_func_input.output_len
         ttft = 0.0
         st = time.perf_counter()
+        output.start_time = st
         most_recent_timestamp = st
         try:
             async with session.post(
@@ -236,6 +242,8 @@ async def async_request_openai_completions(
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
 
+        output.completion_time = time.perf_counter()
+
     if pbar:
         pbar.update(1)
     return output
@@ -268,6 +276,7 @@ async def async_request_truss(
         generated_text = ""
         ttft = 0.0
         st = time.perf_counter()
+        output.start_time = st
         most_recent_timestamp = st
         try:
             async with session.post(
@@ -315,6 +324,8 @@ async def async_request_truss(
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
 
+        output.completion_time = time.perf_counter()
+
     if pbar:
         pbar.update(1)
     return output
@@ -331,7 +342,8 @@ async def async_request_sglang_generate(
         payload = {
             "text": prompt,
             "sampling_params": {
-                "temperature": 0.0,
+                #"temperature": 0.0,
+                "temperature": 1.0,
                 "max_new_tokens": request_func_input.output_len,
                 "ignore_eos": not args.disable_ignore_eos,
             },
@@ -350,6 +362,7 @@ async def async_request_sglang_generate(
         output_len = request_func_input.output_len
         ttft = 0.0
         st = time.perf_counter()
+        output.start_time = st
         most_recent_timestamp = st
         last_output_len = 0
         try:
@@ -408,6 +421,8 @@ async def async_request_sglang_generate(
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
             print(f"{output.error=}")
+
+        output.completion_time = time.perf_counter()
 
     if pbar:
         pbar.update(1)
@@ -474,10 +489,13 @@ def get_tokenizer(
 
 
 def get_dataset(args, tokenizer):
+    # Calculate total requests including warmup
+    total_requests = int(args.num_prompts * (1 + args.warmup_fraction))
+    
     if args.dataset_name == "sharegpt":
         input_requests = sample_sharegpt_requests(
             dataset_path=args.dataset_path,
-            num_requests=args.num_prompts,
+            num_requests=total_requests,
             tokenizer=tokenizer,
             fixed_output_len=args.sharegpt_output_len,
             context_len=args.sharegpt_context_len,
@@ -488,7 +506,7 @@ def get_dataset(args, tokenizer):
         input_requests = sample_random_requests(
             input_len=args.random_input_len,
             output_len=args.random_output_len,
-            num_prompts=args.num_prompts,
+            num_prompts=total_requests,
             range_ratio=args.random_range_ratio,
             tokenizer=tokenizer,
             dataset_path=args.dataset_path,
@@ -496,7 +514,7 @@ def get_dataset(args, tokenizer):
     elif args.dataset_name == "generated-shared-prefix":
         input_requests = sample_generated_shared_prefix_requests(
             num_groups=args.gsp_num_groups,
-            prompts_per_group=args.gsp_prompts_per_group,
+            prompts_per_group=int(args.gsp_prompts_per_group * (1 + args.warmup_fraction)),
             system_prompt_len=args.gsp_system_prompt_len,
             question_len=args.gsp_question_len,
             output_len=args.gsp_output_len,
@@ -505,7 +523,15 @@ def get_dataset(args, tokenizer):
         )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
-    return input_requests
+        
+    # Calculate actual number of warmup requests
+    num_warmup = total_requests - args.num_prompts
+    
+    # Print information about warmup and measurement requests
+    print(f"Total requests: {total_requests} (includes {num_warmup} warmup requests)")
+    print(f"Measurement requests: {args.num_prompts}")
+    
+    return input_requests, num_warmup
 
 
 ASYNC_REQUEST_FUNCS = {
@@ -551,6 +577,7 @@ class BenchmarkMetrics:
     std_e2e_latency_ms: float
     p99_e2e_latency_ms: float
     concurrency: float
+    effective_duration: float = 0.0
 
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
@@ -890,6 +917,7 @@ def calculate_metrics(
     dur_s: float,
     tokenizer: PreTrainedTokenizerBase,
     backend: str,
+    num_warmup_requests: int = 0,
 ) -> Tuple[BenchmarkMetrics, List[int]]:
     output_lens: List[int] = []
     retokenized_output_lens: List[int] = []
@@ -899,8 +927,23 @@ def calculate_metrics(
     tpots: List[float] = []
     ttfts: List[float] = []
     e2e_latencies: List[float] = []
+    
+    # Track start and end times for non-warmup requests for accurate throughput calculation
+    first_non_warmup_start_time = float('inf')
+    last_non_warmup_completion_time = 0.0
+    
     for i in range(len(outputs)):
+        # Skip warmup requests
+        if i < num_warmup_requests:
+            continue
+            
         if outputs[i].success:
+            # Update start and end times for throughput calculation
+            if outputs[i].start_time < first_non_warmup_start_time:
+                first_non_warmup_start_time = outputs[i].start_time
+            if outputs[i].completion_time > last_non_warmup_completion_time:
+                last_non_warmup_completion_time = outputs[i].completion_time
+                
             output_len = outputs[i].output_len
             output_lens.append(output_len)
             #print(f"Generated {i}: {outputs[i].generated_text}")
@@ -928,18 +971,24 @@ def calculate_metrics(
             "on the benchmark arguments.",
             stacklevel=2,
         )
+        
+    # Calculate effective duration for non-warmup requests
+    effective_duration = dur_s
+    if num_warmup_requests > 0 and first_non_warmup_start_time < float('inf') and last_non_warmup_completion_time > 0:
+        effective_duration = last_non_warmup_completion_time - first_non_warmup_start_time
+
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
         total_output=sum(output_lens),
         total_output_retokenized=sum(retokenized_output_lens),
-        request_throughput=completed / dur_s,
-        input_throughput=total_input / dur_s,
-        output_throughput=sum(output_lens) / dur_s,
-        output_throughput_retokenized=sum(retokenized_output_lens) / dur_s,
-        total_throughput=(total_input + sum(output_lens)) / dur_s,
+        request_throughput=completed / effective_duration,
+        input_throughput=total_input / effective_duration,
+        output_throughput=sum(output_lens) / effective_duration,
+        output_throughput_retokenized=sum(retokenized_output_lens) / effective_duration,
+        total_throughput=(total_input + sum(output_lens)) / effective_duration,
         total_throughput_retokenized=(total_input + sum(retokenized_output_lens))
-        / dur_s,
+        / effective_duration,
         mean_ttft_ms=np.mean(ttfts or 0)
         * 1000,  # ttfts is empty if streaming is not supported by backend
         median_ttft_ms=np.median(ttfts or 0) * 1000,
@@ -959,7 +1008,8 @@ def calculate_metrics(
         median_e2e_latency_ms=np.median(e2e_latencies) * 1000,
         std_e2e_latency_ms=np.std(e2e_latencies) * 1000,
         p99_e2e_latency_ms=np.percentile(e2e_latencies, 99) * 1000,
-        concurrency=np.sum(e2e_latencies) / dur_s,
+        concurrency=np.sum(e2e_latencies) / effective_duration,
+        effective_duration=effective_duration,
     )
 
     return metrics, output_lens
@@ -980,6 +1030,7 @@ async def benchmark(
     extra_request_body: Dict[str, Any],
     profile: bool,
     pd_seperated: bool = False,
+    num_warmup_requests: int = 0,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -997,25 +1048,25 @@ async def benchmark(
             return await request_func(request_func_input=request_func_input, pbar=pbar)
 
     # Warmup
-    print("Starting initial single prompt test run...")
-    test_prompt, test_prompt_len, test_output_len = input_requests[0]
-    test_input = RequestFuncInput(
-        model=model_id,
-        prompt=test_prompt,
-        api_url=api_url,
-        prompt_len=test_prompt_len,
-        output_len=min(test_output_len, 32),
-        lora_name=lora_name,
-        extra_request_body=extra_request_body,
-    )
-    test_output = await request_func(request_func_input=test_input)
-    if not test_output.success:
-        raise ValueError(
-            "Initial test run failed - Please make sure benchmark arguments "
-            f"are correctly specified. Error: {test_output.error}"
-        )
-    else:
-        print("Initial test run completed. Starting main benchmark run...")
+    #print("Starting initial single prompt test run...")
+    #test_prompt, test_prompt_len, test_output_len = input_requests[0]
+    #test_input = RequestFuncInput(
+    #    model=model_id,
+    #    prompt=test_prompt,
+    #    api_url=api_url,
+    #    prompt_len=test_prompt_len,
+    #    output_len=min(test_output_len, 32),
+    #    lora_name=lora_name,
+    #    extra_request_body=extra_request_body,
+    #)
+    #test_output = await request_func(request_func_input=test_input)
+    #if not test_output.success:
+    #    raise ValueError(
+    #        "Initial test run failed - Please make sure benchmark arguments "
+    #        f"are correctly specified. Error: {test_output.error}"
+    #    )
+    #else:
+    #    print("Initial test run completed. Starting main benchmark run...")
 
     # Flush cache
     if "sglang" in backend:
@@ -1041,7 +1092,7 @@ async def benchmark(
                 limited_request_func(request_func_input=request_func_input, pbar=None)
             )
         )
-    await asyncio.gather(*warmup_tasks)
+    warmup_outputs = await asyncio.gather(*warmup_tasks)
     warmup_duration = time.perf_counter() - warmup_start_time
     print(f"Warmup completed in {warmup_duration:.2f} seconds")
 
@@ -1102,13 +1153,34 @@ async def benchmark(
 
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
+    print(f"Total benchmark duration: {benchmark_duration:.2f} seconds")
+    
     metrics, output_lens = calculate_metrics(
         input_requests=input_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
         tokenizer=tokenizer,
         backend=backend,
+        num_warmup_requests=num_warmup_requests,
     )
+
+    # write ttfts and itls to a file
+    ttfts = []
+    itls = []
+    for output in warmup_outputs:
+        ttfts.append(output.ttft)
+        for itl in output.itl:
+            itls.append(itl)
+    for output in outputs:
+        ttfts.append(output.ttft)
+        for itl in output.itl:
+            itls.append(itl)
+    with open("ttfts.txt", "w") as f:
+        for ttft in ttfts:
+            f.write(f"{ttft}\n")
+    with open("itls.txt", "w") as f:
+        for itl in itls:
+            f.write(f"{itl}\n")
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Backend:", backend))
@@ -1121,7 +1193,13 @@ async def benchmark(
         )
     )
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
-    print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
+    print("{:<40} {:<10}".format("Warmup requests skipped:", num_warmup_requests))
+    print("{:<40} {:<10.2f}".format("Total benchmark duration (s):", benchmark_duration))
+    
+    # Add effective benchmark duration used for throughput calculation
+    if hasattr(metrics, 'effective_duration'):
+        print("{:<40} {:<10.2f}".format("Effective benchmark duration (s):", metrics.effective_duration))
+    
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
     print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
     print(
@@ -1191,6 +1269,7 @@ async def benchmark(
             "random_range_ratio": args.random_range_ratio,
             # Results
             "duration": benchmark_duration,
+            "effective_duration": metrics.effective_duration,
             "completed": metrics.completed,
             "total_input_tokens": metrics.total_input,
             "total_output_tokens": metrics.total_output,
@@ -1371,7 +1450,7 @@ def run_benchmark(args_: argparse.Namespace):
     model_id = args.model
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer = get_tokenizer(tokenizer_id)
-    input_requests = get_dataset(args, tokenizer)
+    input_requests, num_warmup = get_dataset(args, tokenizer)
 
     return asyncio.run(
         benchmark(
@@ -1389,6 +1468,7 @@ def run_benchmark(args_: argparse.Namespace):
             extra_request_body=extra_request_body,
             profile=args.profile,
             pd_seperated=args.pd_seperated,
+            num_warmup_requests=num_warmup,
         )
     )
 
@@ -1452,6 +1532,12 @@ if __name__ == "__main__":
         type=int,
         default=1000,
         help="Number of prompts to process. Default is 1000.",
+    )
+    parser.add_argument(
+        "--warmup-fraction",
+        type=float,
+        default=0.1,
+        help="Fraction of additional requests to use for warmup (0.1 adds 10% extra warmup requests). These warmup requests are excluded from metrics calculation.",
     )
     parser.add_argument(
         "--sharegpt-output-len",
