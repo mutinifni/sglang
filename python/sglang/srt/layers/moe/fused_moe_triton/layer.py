@@ -34,6 +34,92 @@ if _is_hip:
 
 logger = logging.getLogger(__name__)
 
+import atexit
+import os
+import signal
+
+# Set up logging
+logger = logging.getLogger(__name__)
+log_file = 'expert_counts.log'
+file_handler = logging.FileHandler(log_file)
+file_handler.setLevel(logging.INFO)
+formatter = logging.Formatter('%(message)s')
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+# Disable propagation to root logger to avoid stdout/stderr output
+logger.propagate = False
+
+expert_histogram = {i: 0 for i in range(1, 8)}
+topk_ids_list = []
+max_layer_id = 31
+
+def exit_handler():
+    if torch.distributed.get_rank() == 0:
+        torch.cuda.synchronize()
+        logger.info(f"Number of batches: {len(topk_ids_list)}")
+        logger.info(f"layer_id, num_tokens, num_experts, n_jsd, experts_distribution")
+        layer_id = 0
+        for topk_ids in topk_ids_list:
+            experts_distribution = torch.bincount(topk_ids.flatten(), minlength=8).tolist()
+            num_experts = torch.unique(topk_ids).numel()
+            if layer_id == 0:
+                logger.info(f"{layer_id}, {len(topk_ids)}, {num_experts}, {n_jsd(experts_distribution, 8, 2)}, {experts_distribution}")
+            expert_histogram[num_experts] = expert_histogram.get(num_experts, 0) + 1
+            if layer_id == max_layer_id:
+                layer_id = 0
+            else:
+                layer_id += 1
+        # print the histogram of expert counts
+        logger.info(f"Expert histogram: {expert_histogram}")
+        logger.info("Completed logging")
+        logging.shutdown()
+
+atexit.register(exit_handler)
+
+def signal_handler(signum, frame):
+    exit_handler()
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+import numpy as np
+import pandas as pd
+from scipy.spatial.distance import jensenshannon
+
+def normalize_distribution(p_dist, n, early_exit=True):
+    if isinstance(p_dist, pd.Series):
+        p_dist = p_dist.values
+        # reindex to ensure that the distribution is of length n
+        #p_dist = p_dist.reindex(range(n), fill_value=0).values
+    elif isinstance(p_dist, list):
+        p_dist = np.array(p_dist)
+
+    if early_exit:
+        return p_dist
+
+    if len(p_dist) != n:
+        raise ValueError("p_dist must have length n")
+
+    p_dist = p_dist / np.sum(p_dist)
+
+    if np.any(p_dist < 0) or not np.isclose(np.sum(p_dist), 1):
+        raise ValueError("p_dist must be a valid probability distribution")
+
+    return p_dist
+
+def n_jsd(p_dist, n, k):
+    p_dist = normalize_distribution(p_dist, n)
+    uniform_dist = np.ones(n) / n
+    max_skew_dist = np.zeros(n)
+    max_skew_dist[:k] = 1 / k
+
+    jsd_p_dist = jensenshannon(p_dist, uniform_dist)
+    jsd_max_skew = jensenshannon(max_skew_dist, uniform_dist)
+    return float(jsd_p_dist / jsd_max_skew)
+
 
 class FusedMoeWeightScaleSupported(Enum):
     TENSOR = "tensor"
@@ -175,6 +261,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             correction_bias=correction_bias,
         )
 
+        #if layer.rank == 0:
+        #    topk_ids_list.append(topk_ids.cpu())
+
         if _is_hip and get_bool_env_var("CK_MOE"):
             assert not no_combine, "unsupported"
             return ck_moe(
@@ -305,6 +394,8 @@ class FusedMoE(torch.nn.Module):
         self.use_presharded_weights = use_presharded_weights
         self.inplace = inplace
         self.no_combine = no_combine
+        self.prefix = prefix
+        self.rank = torch.distributed.get_rank()
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = (
