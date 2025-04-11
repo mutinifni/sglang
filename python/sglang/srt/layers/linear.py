@@ -293,6 +293,107 @@ class ReplicatedLinear(LinearBase):
         return s
 
 
+class CustomGatingLayer(ReplicatedLinear):
+    """Custom gating layer for MixtralMoE that can be initialized with a
+    probability distribution to influence the router logits.
+    We override forward pass to add tiny dynamic noise.
+
+    Args:
+        input_size: input dimension of the linear layer.
+        output_size: output dimension of the linear layer (number of experts).
+        bias: If true, add bias.
+        skip_bias_add: If true, skip adding bias but instead return it.
+        params_dtype: Data type for the parameters.
+        quant_config: Quantization configure.
+        prefix: The name of the layer in the state dict, including all parents.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        bias: bool = True,
+        skip_bias_add: bool = False,
+        params_dtype: Optional[torch.dtype] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        # Force bias=True regardless of input
+        super().__init__(
+            input_size,
+            output_size,
+            bias=True,
+            skip_bias_add=skip_bias_add,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+        self.num_experts = output_size
+        self.enable_custom_gating = False
+        self.noise_scale = 0.0
+ 
+    def set_probability_distribution(self, probability_distribution: list, noise_scale=None):
+        """Set a custom probability distribution for routing to experts.
+
+        Args:
+            probability_distribution: List of probabilities for each expert.
+                Length must match the number of experts.
+            noise_scale: Scale of random noise to add (as fraction of min probability).
+                Default is 0.01 (1% of the smallest probability).
+        """
+        if len(probability_distribution) != self.num_experts:
+            raise ValueError(
+                f"Probability distribution length ({len(probability_distribution)}) "
+                f"must match number of experts ({self.num_experts})"
+            ) 
+
+        # Enable custom gating
+        self.enable_custom_gating = True
+
+        # Ensure probability distribution sums to 1
+        prob_tensor = torch.tensor(probability_distribution, dtype=torch.float32)
+        prob_tensor = prob_tensor / prob_tensor.sum()
+        prob_tensor = prob_tensor + 10.0
+        prob_tensor = prob_tensor.to(device=self.weight.device)
+
+        # Set noise scale to minimum non-zero probability
+        self.noise_scale = prob_tensor[prob_tensor > 0].min().item()
+        self.noise_scale *= 2**-4
+
+        ## Print debug information
+        #if torch.distributed.get_rank() == 0:
+        #    print("Probability distribution:")
+        #    print(prob_tensor)
+        #    print(f"Noise scale: {self.noise_scale}")
+        #    print(f"Weight {self.weight.data.shape}:")
+        #    print(self.weight.data)
+        #    print(f"Bias {self.bias.data.shape}:")
+        #    print(self.bias.data)
+
+        with torch.no_grad():
+            self.weight.data.zero_()
+            self.bias.data = prob_tensor.to(self.bias.dtype)
+
+        #if torch.distributed.get_rank() == 0:
+        #    print("After setting probability distribution:")
+        #    print(f"Weight {self.weight.data.shape}:")
+        #    print(self.weight.data)
+        #    print(f"Bias {self.bias.data.shape}:")
+        #    print(self.bias.data)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Call parent's forward to get the base logits
+        base_logits, bias = super().forward(x)
+
+        # Generate and add dynamic noise
+        if self.enable_custom_gating:
+            with torch.no_grad():
+                base_logits.add_(torch.empty_like(base_logits).normal_(0, self.noise_scale))
+
+        return base_logits, bias
+
+
 class ColumnParallelLinear(LinearBase):
     """Linear layer with column parallelism.
 

@@ -31,6 +31,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
+    CustomGatingLayer,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -73,8 +74,12 @@ class MixtralMoE(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.hidden_size = hidden_size
 
+        self.custom_routing_distribution = os.getenv('CUSTOM_ROUTING_DISTRIBUTION', 'default')
+        GateImpl = ReplicatedLinear if self.custom_routing_distribution == 'default' else CustomGatingLayer
+
         # Gate always runs at half / full precision for now.
-        self.gate = ReplicatedLinear(
+        #self.gate = ReplicatedLinear(
+        self.gate = GateImpl(
             hidden_size,
             num_experts,
             bias=False,
@@ -94,42 +99,52 @@ class MixtralMoE(nn.Module):
             tp_size=tp_size,
             prefix=add_prefix("experts", prefix),
         )
-        self.initialize_custom_routing(num_experts, top_k)
         self.num_experts = num_experts
         self.top_k = top_k
+        self.forward_call_count = 0
+        self.custom_routing_enabled = False
 
-    def initialize_custom_routing(self, num_experts, top_k):
+    def initialize_custom_routing(self):
+        """Initialize custom routing based on a named distribution strategy.
+        
+        Args:
+            distribution_name: Name of the distribution strategy to use.
+                Options: 'default', 'uniform', 'skew', 'low', 'med', 'high'
+        """
         self.custom_routing_enabled = True
 
-        distribution_name = os.getenv('CUSTOM_ROUTING_DISTRIBUTION', 'default')
-        if distribution_name == 'default':
-            self.custom_routing_enabled = False
-            distribution = [1.0] * num_experts
-        elif distribution_name == 'uniform':
-            distribution = [1.0] * num_experts
-        elif distribution_name == 'skew':
-            distribution = [1.0] * top_k + [0.0] * (num_experts - top_k)
-        else:
-            raise ValueError(f"Unknown custom routing distribution: {custom_routing_distribution}")
+        if torch.distributed.get_rank() == 0:
+            print(f"Custom routing distribution: {self.custom_routing_distribution}")
 
-        self.prob_dist_per_token = torch.tensor(distribution, device='cuda')
+        if self.custom_routing_distribution == 'default':
+            self.custom_routing_enabled = False
+            distribution = [1.0] * self.num_experts
+        elif self.custom_routing_distribution == 'uniform':
+            distribution = [1.0] * self.num_experts
+        elif self.custom_routing_distribution == 'skew':
+            distribution = [1.0] * self.top_k + [0.0] * (self.num_experts - self.top_k)
+        elif self.custom_routing_distribution == 'low':
+            distribution = [1.0] * (self.num_experts // 2) + [0.8] * (self.num_experts // 2)
+        elif self.custom_routing_distribution == 'med':
+            distribution = [1.0] * (self.num_experts // 2) + [0.5] * (self.num_experts // 2)
+        elif self.custom_routing_distribution == 'high':
+            distribution = [1.0] * (self.num_experts // 2) + [0.2] * (self.num_experts // 2)
+        else:
+            raise ValueError(f"Unknown custom routing distribution: {self.custom_routing_distribution}")
+
+        if self.custom_routing_enabled:
+            self.gate.set_probability_distribution(distribution)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
-        num_tokens = hidden_states.shape[0]
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-
-        # custom_router_logits: (num_tokens, n_experts)
-        probability_distribution = self.prob_dist_per_token.expand(num_tokens, -1)
-        sampled_experts = torch.multinomial(probability_distribution, self.top_k, replacement=False)
-        custom_router_logits = torch.zeros((num_tokens, self.experts.num_experts), device=hidden_states.device)
-        custom_router_logits.scatter_(1, sampled_experts, 1)
-        if self.custom_routing_enabled:
-            router_logits = custom_router_logits
+        #if torch.distributed.get_rank() == 0:
+        #    print(f"Router logits {router_logits.shape}:")
+        #    print(router_logits)
 
         final_hidden_states = self.experts(hidden_states, router_logits)
         if self.tp_size > 1:
@@ -433,6 +448,15 @@ class MixtralForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+                    
+        # After weights are loaded, set up custom routing if specified
+        #if self.custom_routing_distribution != 'default':
+        # Apply to all MixtralMoE layers
+        for name, module in self.named_modules():
+            if isinstance(module, MixtralMoE):
+                module.initialize_custom_routing()
+                if torch.distributed.get_rank() == 0:
+                    print(f"Applied custom routing '{module.custom_routing_distribution}' to {name}")
 
 
 EntryClass = MixtralForCausalLM
