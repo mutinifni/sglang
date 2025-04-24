@@ -4,6 +4,7 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 from transformers import MixtralConfig
+import torch.cuda.nvtx as nvtx
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
@@ -29,9 +30,14 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
+from sglang.srt.profiling import create_profiling_context, TimerContext, ENABLE_CUDA_EVENTS
 
 from sglang.srt.models.mixtral import MixtralAttention
 from sglang.srt.models.llama import LlamaMLP
+
+
+# Global profiling context
+_PROFILING_CTX = create_profiling_context()
 
 
 class DenseMixtralFADecoderLayer(nn.Module):
@@ -44,6 +50,7 @@ class DenseMixtralFADecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_id = layer_id
         rope_theta = getattr(config, "rope_theta", 10000)
         self.self_attn = MixtralAttention(
             hidden_size=self.hidden_size,
@@ -74,21 +81,80 @@ class DenseMixtralFADecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        # Only create profiling regions if profiling is active
+        is_profiling = _PROFILING_CTX is not None and _PROFILING_CTX.profiling_active
+
         # Self Attention
         if residual is None:
             residual = hidden_states
+            # NVTX tracker for first normalization
+            if is_profiling:
+                nvtx.range_push(f"layer{self.layer_id}_input_norm")
             hidden_states = self.input_layernorm(hidden_states)
+            if is_profiling:
+                nvtx.range_pop()
         else:
+            # NVTX tracker for first normalization with residual
+            if is_profiling:
+                nvtx.range_push(f"layer{self.layer_id}_input_norm")
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
+            if is_profiling:
+                nvtx.range_pop()
+
+        # NVTX tracker for attention
+        attn_timer = TimerContext(self.layer_id, "attn") if is_profiling and ENABLE_CUDA_EVENTS else None
+
+        if is_profiling:
+            nvtx.range_push(f"layer{self.layer_id}_attention")
+
+        if attn_timer:
+            with attn_timer:
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
+        else:
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+
+        if is_profiling:
+            nvtx.range_pop()
 
         # Fully Connected
+        # NVTX tracker for post-attention normalization
+        if is_profiling:
+            nvtx.range_push(f"layer{self.layer_id}_post_attn_norm")
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.ffn(hidden_states)
+        if is_profiling:
+            nvtx.range_pop()
+
+        # NVTX tracker for FFN
+        ffn_timer = TimerContext(self.layer_id, "ffn") if is_profiling and ENABLE_CUDA_EVENTS else None
+
+        if is_profiling:
+            nvtx.range_push(f"layer{self.layer_id}_ffn")
+
+        if ffn_timer:
+            with ffn_timer:
+                hidden_states = self.ffn(hidden_states)
+        else:
+            hidden_states = self.ffn(hidden_states)
+
+        if is_profiling:
+            nvtx.range_pop()
+
+        # Record timing information if CUDA events are enabled
+        if attn_timer and ffn_timer and _PROFILING_CTX is not None:
+            _PROFILING_CTX.record_timing(
+                self.layer_id,
+                attn_timer.get_elapsed_time(),
+                ffn_timer.get_elapsed_time()
+            )
+
         return hidden_states, residual
 
 
@@ -128,17 +194,38 @@ class DenseMixtralFAModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        # Check if profiling is active
+        is_profiling = _PROFILING_CTX is not None and _PROFILING_CTX.profiling_active
+
         if input_embeds is None:
+            # NVTX tracker for token embedding
+            if is_profiling:
+                nvtx.range_push("token_embedding")
             hidden_states = self.embed_tokens(input_ids)
+            if is_profiling:
+                nvtx.range_pop()
         else:
             hidden_states = input_embeds
+
         residual = None
         for i in range(len(self.layers)):
+            # NVTX tracker for each decoder layer
+            if is_profiling:
+                nvtx.range_push(f"decoder_layer_{i}")
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
             )
+            if is_profiling:
+                nvtx.range_pop()
+
+        # NVTX tracker for final normalization
+        if is_profiling:
+            nvtx.range_push("final_norm")
         hidden_states, _ = self.norm(hidden_states, residual)
+        if is_profiling:
+            nvtx.range_pop()
+
         return hidden_states
 
 
@@ -168,10 +255,39 @@ class DenseMixtralFAForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        # Check if CUDA graph capture is completed (only relevant if profiling is enabled)
+        is_capturing = False
+        if _PROFILING_CTX is not None and torch.cuda.is_available():
+            is_capturing = torch.cuda.is_current_stream_capturing()
+
+        # Update profiling state if profiling is enabled
+        is_profiling = False
+        if _PROFILING_CTX is not None:
+            is_profiling = _PROFILING_CTX.update(is_capturing)
+
+        # NVTX tracker for model forward with iteration count
+        if is_profiling:
+            nvtx.range_push(f"model_forward_{_PROFILING_CTX.forward_count}")
+
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
-        )
+
+        if is_profiling:
+            nvtx.range_pop()
+
+        # NVTX tracker for logits processing and language modeling head
+        if is_profiling:
+            nvtx.range_push("lm_head_and_logits")
+
+        result = self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
+
+        if is_profiling:
+            nvtx.range_pop()
+
+        # Check if we should print timings at the end of this forward pass
+        if _PROFILING_CTX is not None and _PROFILING_CTX.should_print_timings:
+            _PROFILING_CTX.print_accumulated_timings()
+
+        return result
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # Implement weight loading logic if needed
