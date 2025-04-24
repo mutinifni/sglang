@@ -348,8 +348,8 @@ async def async_request_sglang_generate(
         payload = {
             "text": prompt,
             "sampling_params": {
-                #"temperature": 0.0,
-                "temperature": 1.0,
+                "temperature": 0.0,
+                #"temperature": 1.0,
                 "max_new_tokens": request_func_input.output_len,
                 "ignore_eos": not args.disable_ignore_eos,
             },
@@ -497,7 +497,7 @@ def get_tokenizer(
 def get_dataset(args, tokenizer):
     # Calculate total requests including warmup
     total_requests = int(args.num_prompts * (1 + args.warmup_fraction))
-    
+
     if args.dataset_name == "sharegpt":
         input_requests = sample_sharegpt_requests(
             dataset_path=args.dataset_path,
@@ -517,6 +517,7 @@ def get_dataset(args, tokenizer):
             tokenizer=tokenizer,
             dataset_path=args.dataset_path,
             random_sample=args.dataset_name == "random",
+            consistent_prompts=args.consistent_prompts,
         )
     elif args.dataset_name == "generated-shared-prefix":
         input_requests = sample_generated_shared_prefix_requests(
@@ -530,14 +531,14 @@ def get_dataset(args, tokenizer):
         )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
-        
+
     # Calculate actual number of warmup requests
     num_warmup = total_requests - args.num_prompts
-    
+
     # Print information about warmup and measurement requests
     print(f"Total requests: {total_requests} (includes {num_warmup} warmup requests)")
     print(f"Measurement requests: {args.num_prompts}")
-    
+
     return input_requests, num_warmup
 
 
@@ -716,6 +717,7 @@ def sample_random_requests(
     tokenizer: PreTrainedTokenizerBase,
     dataset_path: str,
     random_sample: bool = True,
+    consistent_prompts: bool = True,
 ) -> List[Tuple[str, int, int]]:
     input_lens = np.random.randint(
         max(int(input_len * range_ratio), 1),
@@ -757,27 +759,54 @@ def sample_random_requests(
 
         # Filter out sequences that are too long or too short
         input_requests: List[Tuple[str, int, int]] = []
-        for data in dataset:
-            i = len(input_requests)
-            if i == num_prompts:
+
+        # If consistent_prompts is True, generate one prompt and repeat it
+        if consistent_prompts:
+            # Get the first valid prompt
+            for data in dataset:
+                prompt = data[0]
+                prompt_token_ids = tokenizer.encode(prompt)
+                prompt_len = len(prompt_token_ids)
+
+                # Skip empty prompt
+                if prompt_len == 0:
+                    continue
+
+                # Generate the consistent prompt with target length
+                if prompt_len > input_lens[0]:
+                    input_ids = prompt_token_ids[: input_lens[0]]
+                else:
+                    ratio = (input_lens[0] + prompt_len - 1) // prompt_len
+                    input_ids = (prompt_token_ids * ratio)[: input_lens[0]]
+                consistent_prompt = tokenizer.decode(input_ids)
+
+                # Use this same prompt for all requests
+                input_requests = [(consistent_prompt, int(input_lens[i]), int(output_lens[i]))
+                                  for i in range(num_prompts)]
                 break
+        else:
+            # Original behavior: generate different prompts
+            for data in dataset:
+                i = len(input_requests)
+                if i == num_prompts:
+                    break
 
-            # Tokenize the prompts and completions.
-            prompt = data[0]
-            prompt_token_ids = tokenizer.encode(prompt)
-            prompt_len = len(prompt_token_ids)
+                # Tokenize the prompts and completions.
+                prompt = data[0]
+                prompt_token_ids = tokenizer.encode(prompt)
+                prompt_len = len(prompt_token_ids)
 
-            # Skip empty prompt
-            if prompt_len == 0:
-                continue
+                # Skip empty prompt
+                if prompt_len == 0:
+                    continue
 
-            if prompt_len > input_lens[i]:
-                input_ids = prompt_token_ids[: input_lens[i]]
-            else:
-                ratio = (input_lens[i] + prompt_len - 1) // prompt_len
-                input_ids = (prompt_token_ids * ratio)[: input_lens[i]]
-            prompt = tokenizer.decode(input_ids)
-            input_requests.append((prompt, int(input_lens[i]), int(output_lens[i])))
+                if prompt_len > input_lens[i]:
+                    input_ids = prompt_token_ids[: input_lens[i]]
+                else:
+                    ratio = (input_lens[i] + prompt_len - 1) // prompt_len
+                    input_ids = (prompt_token_ids * ratio)[: input_lens[i]]
+                prompt = tokenizer.decode(input_ids)
+                input_requests.append((prompt, int(input_lens[i]), int(output_lens[i])))
     else:
         # Sample token ids from random integers. This can cause some NaN issues.
         offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
@@ -934,23 +963,23 @@ def calculate_metrics(
     tpots: List[float] = []
     ttfts: List[float] = []
     e2e_latencies: List[float] = []
-    
+
     # Track start and end times for non-warmup requests for accurate throughput calculation
     first_non_warmup_start_time = float('inf')
     last_non_warmup_completion_time = 0.0
-    
+
     for i in range(len(outputs)):
         # Skip warmup requests
         if i < num_warmup_requests:
             continue
-            
+
         if outputs[i].success:
             # Update start and end times for throughput calculation
             if outputs[i].start_time < first_non_warmup_start_time:
                 first_non_warmup_start_time = outputs[i].start_time
             if outputs[i].completion_time > last_non_warmup_completion_time:
                 last_non_warmup_completion_time = outputs[i].completion_time
-                
+
             output_len = outputs[i].output_len
             output_lens.append(output_len)
             #print(f"Generated {i}: {outputs[i].generated_text}")
@@ -978,7 +1007,7 @@ def calculate_metrics(
             "on the benchmark arguments.",
             stacklevel=2,
         )
-        
+
     # Calculate effective duration for non-warmup requests
     effective_duration = dur_s
     if num_warmup_requests > 0 and first_non_warmup_start_time < float('inf') and last_non_warmup_completion_time > 0:
@@ -1211,7 +1240,7 @@ async def benchmark(
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
     print(f"Total benchmark duration: {benchmark_duration:.2f} seconds")
-    
+
     metrics, output_lens = calculate_metrics(
         input_requests=input_requests,
         outputs=outputs,
@@ -1252,11 +1281,11 @@ async def benchmark(
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
     print("{:<40} {:<10}".format("Warmup requests skipped:", num_warmup_requests))
     print("{:<40} {:<10.2f}".format("Total benchmark duration (s):", benchmark_duration))
-    
+
     # Add effective benchmark duration used for throughput calculation
     if hasattr(metrics, 'effective_duration'):
         print("{:<40} {:<10.2f}".format("Effective benchmark duration (s):", metrics.effective_duration))
-    
+
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
     print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
     print(
@@ -1740,7 +1769,12 @@ if __name__ == "__main__":
         default=1,
         help="Number of warmup requests to run before the benchmark",
     )
-
+    parser.add_argument(
+        "--consistent-prompts",
+        type=bool,
+        default=False,
+        help="Generate consistent prompts for random dataset (default: False)",
+    )
     group = parser.add_argument_group("generated-shared-prefix dataset arguments")
     group.add_argument(
         "--gsp-num-groups",
